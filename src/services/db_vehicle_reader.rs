@@ -8,7 +8,7 @@ use tracing::{debug, info};
 
 use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
-use crate::models::VehicleData;
+use crate::models::{VehicleData, VehicleDataRaw};
 
 #[async_trait]
 pub trait VehicleDataReader: Send + Sync {
@@ -121,21 +121,22 @@ impl VehicleDataReader for DBVehicleReader {
         }
 
         let query = "
-            SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date::date
+            SELECT waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
             FROM waybills
             WHERE vehicle_no = $1
             ORDER BY updated_at DESC
             LIMIT 1
         ";
 
-        let result = sqlx::query_as::<_, VehicleData>(query)
+        let result = sqlx::query_as::<_, VehicleDataRaw>(query)
             .bind(vehicle_no)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| AppError::DbError(e.to_string()))?;
 
         match result {
-            Some(vehicle_data) => {
+            Some(vehicle_data_raw) => {
+                let vehicle_data = VehicleData::from(vehicle_data_raw);
                 self.cache_vehicle_data(vehicle_data.clone()).await;
                 Ok(vehicle_data)
             }
@@ -149,15 +150,17 @@ impl VehicleDataReader for DBVehicleReader {
     async fn get_all_vehicles(&self) -> AppResult<Vec<VehicleData>> {
         let query = "
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date::date
+              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
             FROM waybills
             ORDER BY vehicle_no, updated_at DESC
         ";
 
-        sqlx::query_as::<_, VehicleData>(query)
+        let raw_results = sqlx::query_as::<_, VehicleDataRaw>(query)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| AppError::DbError(e.to_string()))
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+
+        Ok(raw_results.into_iter().map(VehicleData::from).collect())
     }
 
     async fn get_vehicles_by_service_type(
@@ -166,34 +169,38 @@ impl VehicleDataReader for DBVehicleReader {
     ) -> AppResult<Vec<VehicleData>> {
         let query = "
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date::date
+              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
             FROM waybills
             WHERE service_type = $1
             ORDER BY vehicle_no, updated_at DESC
         ";
 
-        sqlx::query_as::<_, VehicleData>(query)
+        let raw_results = sqlx::query_as::<_, VehicleDataRaw>(query)
             .bind(service_type)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| AppError::DbError(e.to_string()))
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+
+        Ok(raw_results.into_iter().map(VehicleData::from).collect())
     }
 
     async fn search_vehicles(&self, query: &str) -> AppResult<Vec<VehicleData>> {
         let search_pattern = format!("%{}%", query);
         let query_sql = "
             SELECT DISTINCT ON (vehicle_no)
-              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date::date
+              waybill_id::text, service_type, vehicle_no, schedule_no, updated_at::timestamptz as last_updated, duty_date
             FROM waybills
             WHERE vehicle_no ILIKE $1 OR waybill_id::text ILIKE $1 OR schedule_no ILIKE $1
             ORDER BY vehicle_no, updated_at DESC
         ";
 
-        sqlx::query_as::<_, VehicleData>(query_sql)
+        let raw_results = sqlx::query_as::<_, VehicleDataRaw>(query_sql)
             .bind(&search_pattern)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| AppError::DbError(e.to_string()))
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+
+        Ok(raw_results.into_iter().map(VehicleData::from).collect())
     }
 
     async fn get_vehicle_count(&self) -> AppResult<i64> {

@@ -1,5 +1,5 @@
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Serialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -12,7 +12,18 @@ pub struct Gate {
     pub lat: f64,
     pub lon: f64,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+// Raw database data structure
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct VehicleDataRaw {
+    pub waybill_id: String,
+    pub service_type: String,
+    pub vehicle_no: String,
+    pub schedule_no: String,
+    pub last_updated: Option<DateTime<Utc>>,
+    pub duty_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VehicleData {
     pub waybill_id: String,
     pub service_type: String,
@@ -20,6 +31,23 @@ pub struct VehicleData {
     pub schedule_no: String,
     pub last_updated: Option<DateTime<Utc>>,
     pub duty_date: Option<NaiveDate>,
+}
+
+impl From<VehicleDataRaw> for VehicleData {
+    fn from(raw: VehicleDataRaw) -> Self {
+        let duty_date = raw
+            .duty_date
+            .and_then(|date_str| NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").ok());
+
+        Self {
+            waybill_id: raw.waybill_id,
+            service_type: raw.service_type,
+            vehicle_no: raw.vehicle_no,
+            schedule_no: raw.schedule_no,
+            last_updated: raw.last_updated,
+            duty_date,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,15 +246,17 @@ pub fn clean_identifier(identifier: &str) -> String {
     decoded.split(':').last().unwrap_or(&decoded).to_string()
 }
 
-pub fn deserialize_gates_from_json_str<'de, D>(deserializer: D) -> Result<Option<Vec<Gate>>, D::Error>
+pub fn deserialize_gates_from_json_str<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<Gate>>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let opt: Option<String> = Option::deserialize(deserializer)?;
     match opt {
-        Some(s) if !s.trim().is_empty() => {
-            serde_json::from_str(&s).map(Some).map_err(serde::de::Error::custom)
-        }
+        Some(s) if !s.trim().is_empty() => serde_json::from_str(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         _ => Ok(None),
     }
 }
