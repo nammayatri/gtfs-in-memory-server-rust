@@ -79,7 +79,7 @@ async fn get_route_stop_mapping_by_route(
 ) -> AppResult<Json<Vec<RouteStopMapping>>> {
     let mappings = app_state
         .gtfs_service
-        .get_route_stop_mapping_by_route(&gtfs_id, &route_code)
+        .get_route_stop_mapping_by_route_optimized(&gtfs_id, &route_code)
         .await?;
     let max_sequence_mappings = get_max_sequence_route_stop_mapping(mappings);
     Ok(Json(max_sequence_mappings))
@@ -115,7 +115,7 @@ async fn get_route_stop_mapping_by_stop(
 ) -> AppResult<Json<Vec<RouteStopMapping>>> {
     let mappings = app_state
         .gtfs_service
-        .get_route_stop_mapping_by_stop(&gtfs_id, &stop_code)
+        .get_route_stop_mapping_by_stop_optimized(&gtfs_id, &stop_code)
         .await?;
     Ok(Json(mappings))
 }
@@ -127,10 +127,18 @@ async fn get_routes_fuzzy(
 ) -> AppResult<Json<Vec<NandiRoutesRes>>> {
     let routes = app_state.gtfs_service.get_routes(&gtfs_id).await?;
     let query_lower = query.to_lowercase();
+    let limit = params.limit.unwrap_or(i32::MAX) as usize;
 
-    let mut unique_routes: HashMap<String, NandiRoutesRes> = HashMap::new();
+    // Pre-allocate with estimated capacity for better performance
+    let mut unique_routes: HashMap<String, NandiRoutesRes> =
+        HashMap::with_capacity(routes.len().min(limit * 2));
 
     for route in routes {
+        // Early exit if we've reached the limit
+        if unique_routes.len() >= limit {
+            break;
+        }
+
         let matches = route
             .long_name
             .as_ref()
@@ -145,11 +153,6 @@ async fn get_routes_fuzzy(
 
         if matches {
             unique_routes.insert(route.id.clone(), route);
-            if let Some(limit) = params.limit {
-                if unique_routes.len() >= limit as usize {
-                    break;
-                }
-            }
         }
     }
 
@@ -160,7 +163,7 @@ async fn get_stops(
     State(app_state): State<AppState>,
     Path(gtfs_id): Path<String>,
 ) -> AppResult<Json<Vec<RouteStopMapping>>> {
-    let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
+    let stops = app_state.gtfs_service.get_stops_optimized(&gtfs_id).await?;
     Ok(Json(stops))
 }
 
@@ -170,7 +173,7 @@ async fn get_stop(
 ) -> AppResult<Json<RouteStopMapping>> {
     let stop = app_state
         .gtfs_service
-        .get_stop(&gtfs_id, &stop_code)
+        .get_stop_optimized(&gtfs_id, &stop_code)
         .await?;
     Ok(Json(stop))
 }
@@ -182,20 +185,23 @@ async fn get_stops_fuzzy(
 ) -> AppResult<Json<Vec<RouteStopMapping>>> {
     let stops = app_state.gtfs_service.get_stops(&gtfs_id).await?;
     let query_lower = query.to_lowercase();
+    let limit = params.limit.unwrap_or(i32::MAX) as usize;
 
-    let mut unique_stops: HashMap<String, RouteStopMapping> = HashMap::new();
+    // Pre-allocate with estimated capacity for better performance
+    let mut unique_stops: HashMap<String, RouteStopMapping> =
+        HashMap::with_capacity(stops.len().min(limit * 2));
 
     for stop in stops {
+        // Early exit if we've reached the limit
+        if unique_stops.len() >= limit {
+            break;
+        }
+
         let matches = stop.stop_name.to_lowercase().contains(&query_lower)
             || stop.stop_code.to_lowercase().contains(&query_lower);
 
         if matches {
             unique_stops.insert(stop.stop_code.clone(), stop);
-            if let Some(limit) = params.limit {
-                if unique_stops.len() >= limit as usize {
-                    break;
-                }
-            }
         }
     }
 
@@ -270,7 +276,9 @@ async fn get_memory_stats(State(app_state): State<AppState>) -> AppResult<Json<s
     Ok(Json(serde_json::json!(stats)))
 }
 
-async fn get_all_cached_data(State(app_state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
+async fn get_all_cached_data(
+    State(app_state): State<AppState>,
+) -> AppResult<Json<serde_json::Value>> {
     let cached_data = app_state.gtfs_service.get_all_cached_data().await;
     Ok(Json(serde_json::to_value(cached_data).map_err(|e| {
         AppError::Internal(format!("Failed to serialize cached data: {}", e))

@@ -187,6 +187,53 @@ pub struct GTFSRouteData {
     pub by_stop: HashMap<String, Vec<usize>>,
 }
 
+// New optimized data structure for better performance
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OptimizedGTFSRouteData {
+    pub mappings: Vec<RouteStopMapping>,
+    pub by_route: HashMap<String, Vec<RouteStopMapping>>,
+    pub by_stop: HashMap<String, Vec<RouteStopMapping>>,
+}
+
+impl OptimizedGTFSRouteData {
+    pub fn from_route_data(route_data: &GTFSRouteData) -> Self {
+        let mut optimized = Self::default();
+
+        // Pre-allocate vectors for better performance
+        optimized.mappings = route_data
+            .mappings
+            .iter()
+            .map(|arc| arc.as_ref().clone())
+            .collect();
+
+        // Build by_route mapping
+        for (route_code, indices) in &route_data.by_route {
+            let mut route_mappings = Vec::with_capacity(indices.len());
+            for &index in indices {
+                if let Some(mapping) = route_data.mappings.get(index) {
+                    route_mappings.push(mapping.as_ref().clone());
+                }
+            }
+            optimized
+                .by_route
+                .insert(route_code.clone(), route_mappings);
+        }
+
+        // Build by_stop mapping
+        for (stop_code, indices) in &route_data.by_stop {
+            let mut stop_mappings = Vec::with_capacity(indices.len());
+            for &index in indices {
+                if let Some(mapping) = route_data.mappings.get(index) {
+                    stop_mappings.push(mapping.as_ref().clone());
+                }
+            }
+            optimized.by_stop.insert(stop_code.clone(), stop_mappings);
+        }
+
+        optimized
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderStopCodeRecord {
     pub gtfs_id: String,
@@ -209,6 +256,7 @@ pub struct CachedDataResponse {
 pub struct GTFSData {
     pub routes_by_gtfs: HashMap<String, HashMap<String, NandiRoutesRes>>,
     pub route_data_by_gtfs: HashMap<String, GTFSRouteData>,
+    pub optimized_route_data_by_gtfs: HashMap<String, OptimizedGTFSRouteData>,
     pub children_by_parent: HashMap<String, HashMap<String, HashSet<String>>>,
     pub data_hash: HashMap<String, String>,
     pub stop_geojsons_by_gtfs: HashMap<String, HashMap<String, StopGeojson>>,
@@ -223,6 +271,19 @@ impl GTFSData {
     pub fn update_data(&mut self, new_data: GTFSData) {
         self.routes_by_gtfs = new_data.routes_by_gtfs;
         self.route_data_by_gtfs = new_data.route_data_by_gtfs;
+
+        // Build optimized data structures
+        self.optimized_route_data_by_gtfs = self
+            .route_data_by_gtfs
+            .iter()
+            .map(|(gtfs_id, route_data)| {
+                (
+                    gtfs_id.clone(),
+                    OptimizedGTFSRouteData::from_route_data(route_data),
+                )
+            })
+            .collect();
+
         self.children_by_parent = new_data.children_by_parent;
         self.data_hash = new_data.data_hash;
         self.stop_geojsons_by_gtfs = new_data.stop_geojsons_by_gtfs;

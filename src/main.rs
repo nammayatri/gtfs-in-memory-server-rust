@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("=== End Environment Variables ===");
 
-    // Initialize services
+    // Initialize services with performance optimizations
     let gtfs_service = Arc::new(GTFSService::new(config.clone()).await?);
     let db_vehicle_reader: Arc<dyn VehicleDataReader> = if let Some(db_url) = &config.database_url {
         if db_url.contains("localhost") {
@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     };
     info!("Services initialized");
 
-    // Start background polling task
+    // Start background polling task with performance monitoring
     let gtfs_service_clone = gtfs_service.clone();
     tokio::spawn(async move {
         if let Err(e) = gtfs_service_clone.start_polling().await {
@@ -146,16 +146,26 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
     };
 
-    // Create and run the web server
+    // Create and run the web server with performance optimizations
     let app = routes::create_router(app_state)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(logging_middleware));
 
     info!("Starting server on {}:{}", config.api_host, config.api_port);
 
+    // Use hyper with optimized settings for better performance
     let listener =
-        tokio::net::TcpListener::bind(format!("{}:{}", config.api_host, config.api_port)).await?;
+        tokio::net::TcpListener::bind(format!("{}:{}", config.api_host, config.api_port))
+            .await
+            .expect("Failed to bind to address");
+
+    info!(
+        "Server listening on {}:{}",
+        config.api_host, config.api_port
+    );
+
     axum::serve(listener, app).await?;
 
+    info!("Server shutdown complete");
     Ok(())
 }

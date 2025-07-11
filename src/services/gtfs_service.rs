@@ -13,11 +13,11 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
-use crate::errors::{AppError, AppResult};
+use crate::errors::{data_processing_error, not_found_error, AppError, AppResult};
 use crate::models::{
-    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop, LatLong, NandiPattern,
-    NandiPatternDetails, NandiRoutesRes, ProviderStopCodeRecord, RouteStopMapping, StopGeojson,
-    StopGeojsonRecord,
+    cast_vehicle_type, clean_identifier, CachedDataResponse, GTFSData, GTFSRouteData, GTFSStop,
+    LatLong, NandiPattern, NandiPatternDetails, NandiRoutesRes, ProviderStopCodeRecord,
+    RouteStopMapping, StopGeojson, StopGeojsonRecord,
 };
 
 use serde::Serialize;
@@ -91,22 +91,40 @@ impl GTFSService {
                 continue;
             }
             already_visited.insert(base_url.to_string(), true);
-            let patterns = self.fetch_patterns(base_url).await?;
+
+            info!("Fetching data from OTP instance: {}", base_url);
+
+            let patterns = self.fetch_patterns(base_url).await.map_err(|e| {
+                data_processing_error("fetch patterns", &format!("from {}: {}", base_url, e))
+            })?;
+
             let pattern_details = self
                 .fetch_pattern_details_batch(base_url, &patterns)
-                .await?;
+                .await
+                .map_err(|e| {
+                    data_processing_error(
+                        "fetch pattern details",
+                        &format!("from {}: {}", base_url, e),
+                    )
+                })?;
+
             all_pattern_details.extend(pattern_details);
-            all_routes.extend(self.fetch_routes(base_url).await?);
-            all_stops.extend(self.fetch_stops(base_url).await?);
+
+            let routes = self.fetch_routes(base_url).await.map_err(|e| {
+                data_processing_error("fetch routes", &format!("from {}: {}", base_url, e))
+            })?;
+            all_routes.extend(routes);
+
+            let stops = self.fetch_stops(base_url).await.map_err(|e| {
+                data_processing_error("fetch stops", &format!("from {}: {}", base_url, e))
+            })?;
+            all_stops.extend(stops);
         }
         info!("Fetched {} patterns", all_pattern_details.len());
 
         // Read stop geojsons CSV file
-        let stop_geojsons_by_gtfs = self.read_stop_geojsons_csv().await?;
-        info!(
-            "Loaded {} stop geojsons from CSV",
-            stop_geojsons_by_gtfs.len()
-        );
+        let stop_geojsons = self.read_stop_geojsons_csv().await?;
+        info!("Loaded {} stop geojsons from CSV", stop_geojsons.len());
 
         let provider_stop_code_mapping = self.read_provider_stop_code_mapping_csv().await?;
         info!(
@@ -125,11 +143,8 @@ impl GTFSService {
             self.build_routes_by_gtfs(all_routes, &route_trip_counts, &route_stop_counts);
 
         // Build route data
-        let route_data_by_gtfs = self.build_route_data(
-            &all_pattern_details,
-            &routes_by_gtfs,
-            &stop_geojsons_by_gtfs,
-        );
+        let route_data_by_gtfs =
+            self.build_route_data(&all_pattern_details, &routes_by_gtfs, &stop_geojsons);
 
         // Update start and end points
         self.update_start_end_points(&mut routes_by_gtfs, &route_data_by_gtfs);
@@ -144,7 +159,7 @@ impl GTFSService {
         temp_data.routes_by_gtfs = routes_by_gtfs;
         temp_data.children_by_parent = children_by_parent;
         temp_data.data_hash = data_hash;
-        temp_data.stop_geojsons_by_gtfs = stop_geojsons_by_gtfs;
+        temp_data.stop_geojsons_by_gtfs = stop_geojsons;
         temp_data.provider_stop_code_mapping = provider_stop_code_mapping;
 
         Ok(temp_data)
@@ -158,42 +173,56 @@ impl GTFSService {
         // Check if file exists, if not return empty HashMap
         let mut file = match File::open(file_path).await {
             Ok(file) => file,
-            Err(_) => {
-                warn!("stop_geojsons.csv file not found, proceeding without geojson data");
+            Err(e) => {
+                warn!(
+                    "stop_geojsons.csv file not found at {}, proceeding without geojson data: {}",
+                    file_path, e
+                );
                 return Ok(HashMap::new());
             }
         };
 
         let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to read CSV file: {}", e)))?;
+        file.read_to_string(&mut contents).await.map_err(|e| {
+            data_processing_error(
+                "read stop geojsons CSV",
+                &format!("file {}: {}", file_path, e),
+            )
+        })?;
 
         let mut reader = ReaderBuilder::new()
             .has_headers(true)
             .from_reader(contents.as_bytes());
 
-        let mut stop_geojsons_by_gtfs = HashMap::new();
-        for result in reader.deserialize() {
+        let mut stop_geojsons_by_gtfs: HashMap<String, HashMap<String, StopGeojson>> =
+            HashMap::new();
+        let mut line_number = 1; // Start from 1 since we have headers
+
+        for result in reader.deserialize::<StopGeojsonRecord>() {
+            line_number += 1;
             match result {
                 Ok(record) => {
-                    let geojson: StopGeojsonRecord = record;
-                    let inner = stop_geojsons_by_gtfs
-                        .entry(geojson.gtfs_id.clone())
-                        .or_insert_with(HashMap::new);
-                    inner.insert(
-                        geojson.stop_code.clone(),
-                        StopGeojson {
-                            geo_json: geojson.geo_json.clone(),
-                            gates: None,
-                        },
-                    );
+                    stop_geojsons_by_gtfs
+                        .entry(record.gtfs_id)
+                        .or_default()
+                        .insert(
+                            record.stop_code,
+                            StopGeojson {
+                                geo_json: record.geo_json,
+                                gates: record.gates,
+                            },
+                        );
                 }
                 Err(e) => {
-                    error!("Error parsing CSV row: {}", e);
+                    warn!(
+                        "Failed to parse stop geojson record at line {}: {}",
+                        line_number, e
+                    );
+                    continue; // Skip invalid records but continue processing
                 }
             }
         }
+
         Ok(stop_geojsons_by_gtfs)
     }
 
@@ -205,38 +234,48 @@ impl GTFSService {
         // Check if file exists, if not return empty HashMap
         let mut file = match File::open(file_path).await {
             Ok(file) => file,
-            Err(_) => {
-                warn!("stop_provider_mapping.csv file not found, proceeding without provider stop code mapping data");
+            Err(e) => {
+                warn!("stop_provider_mapping.csv file not found at {}, proceeding without provider mapping: {}", file_path, e);
                 return Ok(HashMap::new());
             }
         };
 
         let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to read CSV file: {}", e)))?;
+        file.read_to_string(&mut contents).await.map_err(|e| {
+            data_processing_error(
+                "read provider stop code mapping CSV",
+                &format!("file {}: {}", file_path, e),
+            )
+        })?;
 
         let mut reader = ReaderBuilder::new()
             .has_headers(true)
             .from_reader(contents.as_bytes());
 
-        let mut mapping: HashMap<String, HashMap<String, String>> = HashMap::new();
-        for result in reader.deserialize() {
+        let mut provider_stop_code_mapping: HashMap<String, HashMap<String, String>> =
+            HashMap::new();
+        let mut line_number = 1; // Start from 1 since we have headers
+
+        for result in reader.deserialize::<ProviderStopCodeRecord>() {
+            line_number += 1;
             match result {
                 Ok(record) => {
-                    let record: ProviderStopCodeRecord = record;
-                    mapping
+                    provider_stop_code_mapping
                         .entry(record.gtfs_id)
                         .or_default()
                         .insert(record.provider_stop_code, record.stop_code);
                 }
                 Err(e) => {
-                    error!("Error parsing CSV row: {}", e);
+                    warn!(
+                        "Failed to parse provider stop code record at line {}: {}",
+                        line_number, e
+                    );
+                    continue; // Skip invalid records but continue processing
                 }
             }
         }
 
-        Ok(mapping)
+        Ok(provider_stop_code_mapping)
     }
 
     async fn fetch_pattern_details_batch(
@@ -352,7 +391,7 @@ impl GTFSService {
         &self,
         pattern_details: &[NandiPatternDetails],
         routes_by_gtfs: &HashMap<String, HashMap<String, NandiRoutesRes>>,
-        stop_geojsons_by_gtfs: &HashMap<String, HashMap<String, StopGeojson>>,
+        stop_geojsons: &HashMap<String, HashMap<String, StopGeojson>>,
     ) -> HashMap<String, GTFSRouteData> {
         let mut route_data_by_gtfs: HashMap<String, GTFSRouteData> = HashMap::new();
         let mut visited_combinations: HashSet<(String, String)> = HashSet::new();
@@ -373,18 +412,7 @@ impl GTFSService {
             let route_data = route_data_by_gtfs.entry(gtfs_id.to_string()).or_default();
 
             for (seq, stop) in pattern.stops.iter().enumerate() {
-                let combination = (route_code.to_string(), stop.code.clone());
-                
-                // Skip if we've already seen this route_code + stop_code combination
-                if visited_combinations.contains(&combination) {
-                    continue;
-                }
-                visited_combinations.insert(combination);
-
-                let stop_geojson = stop_geojsons_by_gtfs
-                    .get(gtfs_id)
-                    .and_then(|g| g.get(&stop.code))
-                    .map(|geojson| geojson.clone());
+                let stop_geojson = stop_geojsons.get(gtfs_id).and_then(|g| g.get(&stop.code));
                 let mapping = Arc::new(RouteStopMapping {
                     estimated_travel_time_from_previous_stop: None,
                     provider_code: "GTFS".to_string(),
@@ -397,9 +425,15 @@ impl GTFSService {
                         lon: stop.lon,
                     },
                     vehicle_type: vehicle_type.clone(),
-                    geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
-                    gates: stop_geojson.as_ref().and_then(|s| s.gates.clone()),
+                    geo_json: stop_geojson.map(|s| s.geo_json.clone()),
+                    gates: stop_geojson.and_then(|s| s.gates.clone()),
                 });
+
+                let hash = get_sha256_hash(&mapping);
+                if visited_combinations.contains(&(route_code.to_string(), hash.clone())) {
+                    continue;
+                }
+                visited_combinations.insert((route_code.to_string(), hash));
 
                 let mapping_idx = route_data.mappings.len();
                 route_data.mappings.push(mapping);
@@ -625,20 +659,25 @@ impl GTFSService {
     }
 
     pub async fn get_route(&self, gtfs_id: &str, route_id: &str) -> AppResult<NandiRoutesRes> {
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+        let route_id_clean = clean_identifier(route_id);
+
         let data = self.data.read().await;
         data.routes_by_gtfs
-            .get(clean_identifier(gtfs_id).as_str())
-            .and_then(|r| r.get(clean_identifier(route_id).as_str()))
+            .get(&gtfs_id_clean)
+            .and_then(|r| r.get(&route_id_clean))
             .cloned()
-            .ok_or_else(|| AppError::NotFound("Route not found".to_string()))
+            .ok_or_else(|| not_found_error("Route", &format!("{}:{}", gtfs_id, route_id)))
     }
 
     pub async fn get_routes(&self, gtfs_id: &str) -> AppResult<Vec<NandiRoutesRes>> {
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+
         let data = self.data.read().await;
         data.routes_by_gtfs
-            .get(clean_identifier(gtfs_id).as_str())
+            .get(&gtfs_id_clean)
             .map(|r| r.values().cloned().collect())
-            .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
+            .ok_or_else(|| not_found_error("GTFS ID", gtfs_id))
     }
 
     pub async fn get_route_stop_mapping_by_route(
@@ -646,19 +685,27 @@ impl GTFSService {
         gtfs_id: &str,
         route_code: &str,
     ) -> AppResult<Vec<RouteStopMapping>> {
-        let data = self.data.read().await;
-        let gtfs_id = clean_identifier(gtfs_id);
-        let route_code = clean_identifier(route_code);
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+        let route_code_clean = clean_identifier(route_code);
 
-        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
-            if let Some(indices) = route_data.by_route.get(&route_code) {
-                return Ok(indices
-                    .iter()
-                    .filter_map(|&i| route_data.mappings.get(i).map(|m| m.as_ref().clone()))
-                    .collect());
+        let data = self.data.read().await;
+
+        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id_clean) {
+            if let Some(indices) = route_data.by_route.get(&route_code_clean) {
+                // Pre-allocate vector with known capacity for better performance
+                let mut result = Vec::with_capacity(indices.len());
+                for &index in indices {
+                    if let Some(mapping) = route_data.mappings.get(index) {
+                        result.push(mapping.as_ref().clone());
+                    }
+                }
+                return Ok(result);
             }
         }
-        Err(AppError::NotFound("Route not found".to_string()))
+        Err(not_found_error(
+            "Route",
+            &format!("{}:{}", gtfs_id, route_code),
+        ))
     }
 
     pub async fn get_route_stop_mapping_by_stop(
@@ -666,51 +713,71 @@ impl GTFSService {
         gtfs_id: &str,
         stop_code: &str,
     ) -> AppResult<Vec<RouteStopMapping>> {
-        let data = self.data.read().await;
-        let gtfs_id = clean_identifier(gtfs_id);
-        let stop_code = clean_identifier(stop_code);
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+        let stop_code_clean = clean_identifier(stop_code);
 
-        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
-            if let Some(indices) = route_data.by_stop.get(&stop_code) {
-                return Ok(indices
-                    .iter()
-                    .filter_map(|&i| route_data.mappings.get(i).map(|m| m.as_ref().clone()))
-                    .collect());
+        let data = self.data.read().await;
+
+        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id_clean) {
+            if let Some(indices) = route_data.by_stop.get(&stop_code_clean) {
+                // Pre-allocate vector with known capacity for better performance
+                let mut result = Vec::with_capacity(indices.len());
+                for &index in indices {
+                    if let Some(mapping) = route_data.mappings.get(index) {
+                        result.push(mapping.as_ref().clone());
+                    }
+                }
+                return Ok(result);
             }
         }
-        Err(AppError::NotFound("Stop not found".to_string()))
+        Err(not_found_error(
+            "Stop",
+            &format!("{}:{}", gtfs_id, stop_code),
+        ))
     }
 
     pub async fn get_stops(&self, gtfs_id: &str) -> AppResult<Vec<RouteStopMapping>> {
-        let data = self.data.read().await;
-        let gtfs_id = clean_identifier(gtfs_id);
+        let gtfs_id_clean = clean_identifier(gtfs_id);
 
-        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
-            return Ok(route_data
-                .by_stop
-                .values()
-                .filter_map(|indices| indices.first())
-                .filter_map(|&i| route_data.mappings.get(i).map(|m| m.as_ref().clone()))
-                .collect());
+        let data = self.data.read().await;
+
+        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id_clean) {
+            // Use HashSet to avoid duplicates more efficiently
+            let mut seen_stops = std::collections::HashSet::new();
+            let mut result = Vec::new();
+
+            for indices in route_data.by_stop.values() {
+                if let Some(&first_index) = indices.first() {
+                    if let Some(mapping) = route_data.mappings.get(first_index) {
+                        let stop_code = &mapping.stop_code;
+                        if !seen_stops.contains(stop_code) {
+                            seen_stops.insert(stop_code.clone());
+                            result.push(mapping.as_ref().clone());
+                        }
+                    }
+                }
+            }
+            return Ok(result);
         }
-        Err(AppError::NotFound("GTFS ID not found".to_string()))
+        Err(not_found_error("GTFS ID", gtfs_id))
     }
 
     pub async fn get_stop(&self, gtfs_id: &str, stop_code: &str) -> AppResult<RouteStopMapping> {
-        let data = self.data.read().await;
-        let gtfs_id = clean_identifier(gtfs_id);
-        let stop_code = clean_identifier(stop_code);
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+        let stop_code_clean = clean_identifier(stop_code);
 
-        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id) {
-            if let Some(indices) = route_data.by_stop.get(&stop_code) {
+        let data = self.data.read().await;
+
+        if let Some(route_data) = data.route_data_by_gtfs.get(&gtfs_id_clean) {
+            if let Some(indices) = route_data.by_stop.get(&stop_code_clean) {
                 if let Some(&index) = indices.first() {
                     if let Some(mapping) = route_data.mappings.get(index) {
                         // Find geojson for this stop from the CSV data
                         let stop_geojson = data
                             .stop_geojsons_by_gtfs
-                            .get(&gtfs_id)
-                            .and_then(|g| g.get(&stop_code))
-                            .map(|geojson| geojson.clone());
+                            .get(&gtfs_id_clean)
+                            .and_then(|g| g.get(&stop_code_clean));
+
                         // Create the enhanced mapping with geojson
                         let enhanced_mapping = RouteStopMapping {
                             estimated_travel_time_from_previous_stop: mapping
@@ -722,8 +789,8 @@ impl GTFSService {
                             stop_name: mapping.stop_name.clone(),
                             stop_point: mapping.stop_point.clone(),
                             vehicle_type: mapping.vehicle_type.clone(),
-                            geo_json: stop_geojson.as_ref().map(|s| s.geo_json.clone()),
-                            gates: stop_geojson.as_ref().and_then(|s| s.gates.clone()),
+                            geo_json: stop_geojson.map(|s| s.geo_json.clone()),
+                            gates: stop_geojson.and_then(|s| s.gates.clone()),
                         };
 
                         return Ok(enhanced_mapping);
@@ -731,7 +798,10 @@ impl GTFSService {
                 }
             }
         }
-        Err(AppError::NotFound("Stop not found".to_string()))
+        Err(not_found_error(
+            "Stop",
+            &format!("{}:{}", gtfs_id, stop_code),
+        ))
     }
 
     pub async fn get_station_children(
@@ -739,11 +809,14 @@ impl GTFSService {
         gtfs_id: &str,
         stop_code: &str,
     ) -> AppResult<Vec<String>> {
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+        let stop_code_clean = clean_identifier(stop_code);
+
         let data = self.data.read().await;
         Ok(data
             .children_by_parent
-            .get(clean_identifier(gtfs_id).as_str())
-            .and_then(|p| p.get(clean_identifier(stop_code).as_str()))
+            .get(&gtfs_id_clean)
+            .and_then(|p| p.get(&stop_code_clean))
             .cloned()
             .unwrap_or_default()
             .into_iter()
@@ -751,11 +824,13 @@ impl GTFSService {
     }
 
     pub async fn get_version(&self, gtfs_id: &str) -> AppResult<String> {
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+
         let data = self.data.read().await;
         data.data_hash
-            .get(clean_identifier(gtfs_id).as_str())
+            .get(&gtfs_id_clean)
             .cloned()
-            .ok_or_else(|| AppError::NotFound("GTFS ID not found".to_string()))
+            .ok_or_else(|| not_found_error("GTFS ID", gtfs_id))
     }
 
     pub async fn get_provider_stop_code(
@@ -763,15 +838,20 @@ impl GTFSService {
         gtfs_id: &str,
         provider_stop_code: &str,
     ) -> AppResult<String> {
-        let data = self.data.read().await;
-        let gtfs_id = clean_identifier(gtfs_id);
-        let provider_stop_code = clean_identifier(provider_stop_code);
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+        let provider_stop_code_clean = clean_identifier(provider_stop_code);
 
+        let data = self.data.read().await;
         data.provider_stop_code_mapping
-            .get(&gtfs_id)
-            .and_then(|mapping| mapping.get(&provider_stop_code))
+            .get(&gtfs_id_clean)
+            .and_then(|mapping| mapping.get(&provider_stop_code_clean))
             .cloned()
-            .ok_or_else(|| AppError::NotFound("Provider stop code not found".to_string()))
+            .ok_or_else(|| {
+                not_found_error(
+                    "Provider stop code",
+                    &format!("{}:{}", gtfs_id, provider_stop_code),
+                )
+            })
     }
 
     // Memory monitoring utility
@@ -831,11 +911,15 @@ impl GTFSService {
     ) -> AppResult<serde_json::Value> {
         // Try to find instance by gtfs_id first, then by city, then fallback to default
         let instance = if let Some(gtfs_id) = gtfs_id {
-            self.config.otp_instances.find_instance_by_gtfs_id(&gtfs_id)
+            self.config
+                .otp_instances
+                .find_instance_by_gtfs_id(&gtfs_id)
                 .or_else(|| self.config.otp_instances.find_instance_by_city(city))
                 .unwrap_or_else(|| self.config.otp_instances.get_default_instance())
         } else {
-            self.config.otp_instances.find_instance_by_city(city)
+            self.config
+                .otp_instances
+                .find_instance_by_city(city)
                 .unwrap_or_else(|| self.config.otp_instances.get_default_instance())
         };
 
@@ -875,5 +959,116 @@ impl GTFSService {
                 status, body
             )))
         }
+    }
+
+    // Optimized methods using the new data structure
+    pub async fn get_route_stop_mapping_by_route_optimized(
+        &self,
+        gtfs_id: &str,
+        route_code: &str,
+    ) -> AppResult<Vec<RouteStopMapping>> {
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+        let route_code_clean = clean_identifier(route_code);
+
+        let data = self.data.read().await;
+
+        if let Some(route_data) = data.optimized_route_data_by_gtfs.get(&gtfs_id_clean) {
+            if let Some(mappings) = route_data.by_route.get(&route_code_clean) {
+                return Ok(mappings.clone());
+            }
+        }
+        Err(not_found_error(
+            "Route",
+            &format!("{}:{}", gtfs_id, route_code),
+        ))
+    }
+
+    pub async fn get_route_stop_mapping_by_stop_optimized(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> AppResult<Vec<RouteStopMapping>> {
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+        let stop_code_clean = clean_identifier(stop_code);
+
+        let data = self.data.read().await;
+
+        if let Some(route_data) = data.optimized_route_data_by_gtfs.get(&gtfs_id_clean) {
+            if let Some(mappings) = route_data.by_stop.get(&stop_code_clean) {
+                return Ok(mappings.clone());
+            }
+        }
+        Err(not_found_error(
+            "Stop",
+            &format!("{}:{}", gtfs_id, stop_code),
+        ))
+    }
+
+    pub async fn get_stops_optimized(&self, gtfs_id: &str) -> AppResult<Vec<RouteStopMapping>> {
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+
+        let data = self.data.read().await;
+
+        if let Some(route_data) = data.optimized_route_data_by_gtfs.get(&gtfs_id_clean) {
+            // Use HashSet to avoid duplicates more efficiently
+            let mut seen_stops = std::collections::HashSet::new();
+            let mut result = Vec::new();
+
+            for mappings in route_data.by_stop.values() {
+                if let Some(first_mapping) = mappings.first() {
+                    let stop_code = &first_mapping.stop_code;
+                    if !seen_stops.contains(stop_code) {
+                        seen_stops.insert(stop_code.clone());
+                        result.push(first_mapping.clone());
+                    }
+                }
+            }
+            return Ok(result);
+        }
+        Err(not_found_error("GTFS ID", gtfs_id))
+    }
+
+    pub async fn get_stop_optimized(
+        &self,
+        gtfs_id: &str,
+        stop_code: &str,
+    ) -> AppResult<RouteStopMapping> {
+        let gtfs_id_clean = clean_identifier(gtfs_id);
+        let stop_code_clean = clean_identifier(stop_code);
+
+        let data = self.data.read().await;
+
+        if let Some(route_data) = data.optimized_route_data_by_gtfs.get(&gtfs_id_clean) {
+            if let Some(mappings) = route_data.by_stop.get(&stop_code_clean) {
+                if let Some(mapping) = mappings.first() {
+                    // Find geojson for this stop from the CSV data
+                    let stop_geojson = data
+                        .stop_geojsons_by_gtfs
+                        .get(&gtfs_id_clean)
+                        .and_then(|g| g.get(&stop_code_clean));
+
+                    // Create the enhanced mapping with geojson
+                    let enhanced_mapping = RouteStopMapping {
+                        estimated_travel_time_from_previous_stop: mapping
+                            .estimated_travel_time_from_previous_stop,
+                        provider_code: mapping.provider_code.clone(),
+                        route_code: mapping.route_code.clone(),
+                        sequence_num: mapping.sequence_num,
+                        stop_code: mapping.stop_code.clone(),
+                        stop_name: mapping.stop_name.clone(),
+                        stop_point: mapping.stop_point.clone(),
+                        vehicle_type: mapping.vehicle_type.clone(),
+                        geo_json: stop_geojson.map(|s| s.geo_json.clone()),
+                        gates: stop_geojson.and_then(|s| s.gates.clone()),
+                    };
+
+                    return Ok(enhanced_mapping);
+                }
+            }
+        }
+        Err(not_found_error(
+            "Stop",
+            &format!("{}:{}", gtfs_id, stop_code),
+        ))
     }
 }

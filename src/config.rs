@@ -17,12 +17,14 @@ pub struct OtpConfig {
 
 impl OtpConfig {
     pub fn find_instance_by_gtfs_id(&self, gtfs_id: &str) -> Option<&OtpInstance> {
-        self.gtfs_id_based_instances.iter()
+        self.gtfs_id_based_instances
+            .iter()
             .find(|instance| instance.identifier == gtfs_id)
     }
 
     pub fn find_instance_by_city(&self, city: &str) -> Option<&OtpInstance> {
-        self.city_based_instances.iter()
+        self.city_based_instances
+            .iter()
             .find(|instance| instance.identifier == city)
     }
 
