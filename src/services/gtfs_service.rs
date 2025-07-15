@@ -634,7 +634,12 @@ impl GTFSService {
         format!("{:x}", hasher.finalize())
     }
 
-    async fn fetch_with_retry<T>(&self, url_str: &str, service: &str) -> AppResult<T>
+    async fn fetch_with_retry<T>(
+        &self,
+        url_str: &str,
+        templated_url: &str,
+        service: &str,
+    ) -> AppResult<T>
     where
         T: for<'de> serde::Deserialize<'de>,
     {
@@ -645,7 +650,13 @@ impl GTFSService {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
-                        call_external_api!(method, url_str, service, status.as_str(), start_time);
+                        call_external_api!(
+                            method,
+                            templated_url,
+                            service,
+                            status.as_str(),
+                            start_time
+                        );
                         return response.json::<T>().await.map_err(|e| {
                             AppError::Internal(format!("Failed to deserialize response: {}", e))
                         });
@@ -662,7 +673,13 @@ impl GTFSService {
                         let status = response.status();
                         let body = response.text().await.unwrap_or_default();
                         error!("HTTP request failed with status {}: {}", status, body);
-                        call_external_api!(method, url_str, service, status.as_str(), start_time);
+                        call_external_api!(
+                            method,
+                            templated_url,
+                            service,
+                            status.as_str(),
+                            start_time
+                        );
                         return Err(AppError::Internal(format!(
                             "HTTP request failed: {} - {}",
                             status, body
@@ -677,7 +694,7 @@ impl GTFSService {
                         ))
                         .await;
                     } else {
-                        call_external_api!(method, url_str, service, "500", start_time);
+                        call_external_api!(method, templated_url, service, "500", start_time);
                         return Err(AppError::HttpRequest(e));
                     }
                 }
@@ -688,7 +705,7 @@ impl GTFSService {
 
     async fn fetch_patterns(&self, base_url: &str) -> AppResult<Vec<NandiPattern>> {
         let url = format!("{}/otp/routers/default/index/patterns", base_url);
-        self.fetch_with_retry(&url, "fetch_patterns").await
+        self.fetch_with_retry(&url, &url, "fetch_patterns").await
     }
 
     async fn fetch_pattern_details(
@@ -700,17 +717,19 @@ impl GTFSService {
             "{}/otp/routers/default/index/patterns/{}",
             base_url, pattern_id
         );
-        self.fetch_with_retry(&url, "fetch_pattern_details").await
+        let templated_url = format!("{}/otp/routers/default/index/patterns/:pattern_id", base_url);
+        self.fetch_with_retry(&url, &templated_url, "fetch_pattern_details")
+            .await
     }
 
     async fn fetch_routes(&self, base_url: &str) -> AppResult<Vec<NandiRoutesRes>> {
         let url = format!("{}/otp/routers/default/index/routes", base_url);
-        self.fetch_with_retry(&url, "fetch_routes").await
+        self.fetch_with_retry(&url, &url, "fetch_routes").await
     }
 
     async fn fetch_stops(&self, base_url: &str) -> AppResult<Vec<GTFSStop>> {
         let url = format!("{}/otp/routers/default/index/stops", base_url);
-        self.fetch_with_retry(&url, "fetch_stops").await
+        self.fetch_with_retry(&url, &url, "fetch_stops").await
     }
 
     pub async fn is_ready(&self) -> bool {

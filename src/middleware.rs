@@ -99,21 +99,22 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let start_time = Instant::now();
-
-        let req_headers = get_headers(req.request());
-        let req_path = get_path(req.request());
         let req_method = get_method(req.request());
+        let req_headers = get_headers(req.request());
+        let raw_path = req.path().to_string();
 
         let fut = self.service.call(req);
+
         Box::pin(async move {
             match fut.await {
                 Ok(response) => {
+                    let req_path = get_path(response.request());
                     calculate_metrics(
                         response.response().error(),
                         response.status(),
                         get_headers(response.request()),
                         get_method(response.request()),
-                        get_path(response.request()),
+                        req_path,
                         start_time,
                     );
                     Ok(response)
@@ -125,7 +126,7 @@ where
                         err_resp_status,
                         req_headers,
                         req_method,
-                        req_path,
+                        raw_path,
                         start_time,
                     );
                     Err(err)
@@ -145,21 +146,17 @@ where
 /// # Returns
 /// * `String` - The path string with placeholders for matched info.
 fn get_path(request: &HttpRequest) -> String {
-    let mut path = request.path().to_string();
-    request
-        .match_info()
-        .iter()
-        .for_each(|(path_name, path_val)| {
-            path = path.replace(path_val, format!(":{path_name}").as_str());
-        });
+    let pattern = request
+        .match_pattern()
+        .unwrap_or_else(|| request.path().to_string());
 
-    if let Ok(re) =
-        Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-    {
-        path = re.replace_all(&path, ":id").to_string()
+    // This regex finds all occurrences of `{word}` and replaces them with `:word`
+    // e.g., /routes/{gtfs_id} -> /routes/:gtfs_id
+    if let Ok(re) = Regex::new(r"\{(\w+)\}") {
+        return re.replace_all(&pattern, ":$1").to_string();
     }
 
-    path
+    pattern
 }
 
 /// Get the method from the HTTP request.
@@ -229,5 +226,3 @@ fn calculate_metrics(
         );
     }
 }
-
-
